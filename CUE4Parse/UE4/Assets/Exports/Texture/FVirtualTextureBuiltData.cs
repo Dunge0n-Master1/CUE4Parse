@@ -75,7 +75,7 @@ namespace CUE4Parse.UE4.Assets.Exports.Texture
             TileBorderSize = Ar.Read<uint>();
             if (Ar.Game >= EGame.GAME_UE5_0) TileDataOffsetPerLayer = Ar.ReadArray<uint>();
 
-            if (!bStripMips)
+            if (!bStripMips || Ar.Game >= EGame.GAME_UE4_23)
             {
                 NumMips = Ar.Read<uint>();
                 Width = Ar.Read<uint>();
