@@ -10,12 +10,245 @@ using CUE4Parse_Conversion.Textures.DXT;
 using CUE4Parse.UE4.Exceptions;
 using SkiaSharp;
 using static CUE4Parse.Utils.TypeConversionUtils;
+using System.Collections.Generic;
 
 namespace CUE4Parse_Conversion.Textures;
 
 public static class TextureDecoder
 {
-    public static SKBitmap? Decode(this UTexture texture, ETexturePlatform platform = ETexturePlatform.DesktopMobile) => texture.Decode(texture.GetFirstMip(), platform);
+    public static SKBitmap? Decode(this UTexture texture, ETexturePlatform platform = ETexturePlatform.DesktopMobile) => texture.IsVirtual && platform == ETexturePlatform.DesktopMobile ? texture.Decode(texture.PlatformData.VTData, platform) : texture.Decode(texture.GetFirstMip(), platform);
+
+    public static SKBitmap? Decode(this UTexture texture, FVirtualTextureBuiltData? vtdata, ETexturePlatform platform = ETexturePlatform.DesktopMobile)
+    {
+        Int32 part1by1(Int32 n)
+        {
+            n &= 0x0000ffff;
+            n = (n | (n << 8)) & 0x00FF00FF;
+            n = (n | (n << 4)) & 0x0F0F0F0F;
+            n = (n | (n << 2)) & 0x33333333;
+            n = (n | (n << 1)) & 0x55555555;
+
+            return n;
+        }
+
+        int UpperBound<T>(T[] array, T value)
+        {
+            if (array.Length == 0)
+                return -1;
+
+            Comparer<T> comparer = Comparer<T>.Default;
+            int start = 0;
+            int end = array.Length - 1;
+            int mid;
+
+            do
+            {
+                mid = (start + end) / 2;
+
+                if (comparer.Compare(array[mid], value) <= 0)
+                {
+                    if (mid < (array.Length - 1) && comparer.Compare(value, array[mid + 1]) < 0)
+                        return mid + 1;
+
+                    start = mid + 1;
+                }
+                else
+                    end = mid - 1;
+            } while (start <= end);
+
+            if (comparer.Compare(value, array[0]) < 0)
+                return 0;
+
+            return mid + 1;
+        }
+
+        if (vtdata == null)
+            return null;
+
+        FVirtualTextureDataChunk chunk = vtdata.Chunks[0];
+        byte[] bulk_data = chunk.BulkData.Data;
+        uint chunk_offset = vtdata.BaseOffsetPerMip[0];
+
+        int width = (int) vtdata.Width;
+        int height = (int) vtdata.Height;
+
+        uint[] Addresses = vtdata.TileOffsetData[0].Addresses;
+        uint[] Offsets = vtdata.TileOffsetData[0].Offsets;
+
+        int tile_size_px = (int) vtdata.TileSize;
+        uint tile_size_bytes = vtdata.TileDataOffsetPerLayer.Last();
+        int border_size = (int) vtdata.TileBorderSize;
+        int tile_width = tile_size_px + border_size * 2;
+        int tile_height = tile_size_px + border_size * 2;
+        int tile_z = (int) vtdata.NumLayers;
+
+        int rows = height / tile_size_px;
+        int cols = width / tile_size_px;
+
+        EPixelFormat format = texture.Format;
+        if (PixelFormatUtils.PixelFormats.ElementAtOrDefault((int) format) is not { Supported: true } formatInfo || formatInfo.BlockBytes == 0)
+            throw new NotImplementedException($"The supplied pixel format {format} is not supported!");
+
+        using SKSurface surface = SKSurface.Create(new SKImageInfo(width, height));
+        using SKCanvas canvas = surface.Canvas;
+        canvas.Clear(SKColors.Transparent);
+
+        for (int row = 0; row < rows; row++)
+        {
+            for (int col = 0; col < cols; col++)
+            {
+                uint tile_id = (uint) (part1by1(col) | (part1by1(row) << 1));
+                uint tile_offset;
+                int BlockIndex = UpperBound(Addresses, tile_id) - 1;
+                uint BaseOffset = Offsets[BlockIndex];
+
+                if (BaseOffset == ~0u)
+                    continue;
+                else
+                {
+                    uint BaseAddress = Addresses[BlockIndex];
+                    uint LocalOffset = tile_id - BaseAddress;
+                    tile_offset = chunk_offset + ((BaseOffset + LocalOffset) * tile_size_bytes);
+                }
+
+                if (tile_offset >= chunk.SizeInBytes)
+                    continue;
+
+                byte[] data = bulk_data.Skip((int) tile_offset).Take((int) tile_size_bytes).ToArray();
+                SKColorType colorType;
+
+                switch (format)
+                {
+                    case EPixelFormat.PF_DXT1:
+                        data = DXTDecoder.DXT1(data, tile_width, tile_height, tile_z);
+                        colorType = SKColorType.Rgba8888;
+                        break;
+                    case EPixelFormat.PF_DXT5:
+                        data = DXTDecoder.DXT5(data, tile_width, tile_height, tile_z);
+                        colorType = SKColorType.Rgba8888;
+                        break;
+                    case EPixelFormat.PF_ASTC_4x4:
+                    case EPixelFormat.PF_ASTC_6x6:
+                    case EPixelFormat.PF_ASTC_8x8:
+                    case EPixelFormat.PF_ASTC_10x10:
+                    case EPixelFormat.PF_ASTC_12x12:
+                        data = ASTCDecoder.RGBA8888(
+                            data,
+                            formatInfo.BlockSizeX,
+                            formatInfo.BlockSizeY,
+                            formatInfo.BlockSizeZ,
+                            tile_width, tile_height, tile_z);
+                        colorType = SKColorType.Rgba8888;
+
+                        if (texture.IsNormalMap)
+                        {
+                            unsafe
+                            {
+                                var offset = 0;
+                                fixed (byte* d = data)
+                                {
+                                    for (var i = 0; i < tile_width * tile_height; i++)
+                                    {
+                                        d[offset + 2] = BCDecoder.GetZNormal(d[offset], d[offset + 1]);
+                                        offset += 4;
+                                    }
+                                }
+                            }
+                        }
+
+                        break;
+                    case EPixelFormat.PF_BC4:
+                        data = BCDecoder.BC4(data, tile_width, tile_height);
+                        colorType = SKColorType.Rgb888x;
+                        break;
+                    case EPixelFormat.PF_BC5:
+                        data = BCDecoder.BC5(data, tile_width, tile_height);
+                        colorType = SKColorType.Rgb888x;
+                        break;
+                    case EPixelFormat.PF_BC6H:
+                        data = Detex.DecodeDetexLinear(data, tile_width, tile_height, true,
+                            DetexTextureFormat.DETEX_TEXTURE_FORMAT_BPTC_FLOAT,
+                            DetexPixelFormat.DETEX_PIXEL_FORMAT_FLOAT_RGBX16);
+                        colorType = SKColorType.Rgb565;
+                        break;
+                    case EPixelFormat.PF_BC7:
+                        data = Detex.DecodeDetexLinear(data, tile_width, tile_height, false,
+                            DetexTextureFormat.DETEX_TEXTURE_FORMAT_BPTC,
+                            DetexPixelFormat.DETEX_PIXEL_FORMAT_RGBA8);
+                        colorType = SKColorType.Rgba8888;
+                        break;
+                    case EPixelFormat.PF_ETC1:
+                        data = Detex.DecodeDetexLinear(data, tile_width, tile_height, false,
+                            DetexTextureFormat.DETEX_TEXTURE_FORMAT_ETC1,
+                            DetexPixelFormat.DETEX_PIXEL_FORMAT_RGBA8);
+                        colorType = SKColorType.Rgba8888;
+                        break;
+                    case EPixelFormat.PF_ETC2_RGB:
+                        data = Detex.DecodeDetexLinear(data, tile_width, tile_height, false,
+                            DetexTextureFormat.DETEX_TEXTURE_FORMAT_ETC2,
+                            DetexPixelFormat.DETEX_PIXEL_FORMAT_RGBA8);
+                        colorType = SKColorType.Rgba8888;
+                        break;
+                    case EPixelFormat.PF_ETC2_RGBA:
+                        data = Detex.DecodeDetexLinear(data, tile_width, tile_height, false,
+                            DetexTextureFormat.DETEX_TEXTURE_FORMAT_ETC2_EAC,
+                            DetexPixelFormat.DETEX_PIXEL_FORMAT_RGBA8);
+                        colorType = SKColorType.Rgba8888;
+                        break;
+                    case EPixelFormat.PF_R16F:
+                    case EPixelFormat.PF_R16F_FILTER:
+                    case EPixelFormat.PF_G16:
+                        unsafe
+                        {
+                            fixed (byte* d = data)
+                            {
+                                data = ConvertRawR16DataToRGB888X(tile_width, tile_height, d, tile_width * 2);
+                            }
+                        }
+
+                        colorType = SKColorType.Rgb888x;
+                        break;
+                    case EPixelFormat.PF_B8G8R8A8:
+                        colorType = SKColorType.Bgra8888;
+                        break;
+                    case EPixelFormat.PF_G8:
+                        colorType = SKColorType.Gray8;
+                        break;
+                    case EPixelFormat.PF_FloatRGBA:
+                        unsafe
+                        {
+                            fixed (byte* d = data)
+                            {
+                                data = ConvertRawR16G16B16A16FDataToRGBA8888(tile_width, tile_height, d, tile_width * 8, false);
+                            }
+                        }
+
+                        colorType = SKColorType.Rgba8888;
+                        break;
+                    default:
+                        throw new NotImplementedException($"Unknown pixel format: {format}");
+                }
+
+                var info = new SKImageInfo(tile_width, tile_height, colorType, SKAlphaType.Unpremul);
+                using var bitmap = new SKBitmap();
+
+                unsafe
+                {
+                    var pixelsPtr = NativeMemory.Alloc((nuint) data.Length);
+                    fixed (byte* p = data)
+                    {
+                        Unsafe.CopyBlockUnaligned(pixelsPtr, p, (uint) data.Length);
+                    }
+
+                    bitmap.InstallPixels(info, new IntPtr(pixelsPtr), info.RowBytes, (address, _) => NativeMemory.Free(address.ToPointer()));
+                }
+
+                canvas.DrawBitmap(bitmap, (tile_size_px * col) - (col == 0 ? border_size : 0), (tile_size_px * row) - (row == 0 ? border_size : 0));
+            }
+        }
+
+        return SKBitmap.FromImage(surface.Snapshot());
+    }
 
     public static SKBitmap? Decode(this UTexture texture, FTexture2DMipMap? mip, ETexturePlatform platform = ETexturePlatform.DesktopMobile)
     {
